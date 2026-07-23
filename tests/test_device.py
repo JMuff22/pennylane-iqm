@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pennylane as qml
 import pytest
+from iqm.iqm_server_client.models import JobStatus
 from pennylane.devices import ExecutionConfig
 from pennylane.tape import QuantumScript
 
@@ -214,6 +215,28 @@ class TestPreprocessTransforms:
 		names = [t.tape_transform.__name__ for t in dev.preprocess_transforms()]
 		assert "_transpile" in names
 
+	def test_routing_swaps_are_decomposed_before_execution(self):
+		dev = make_device(wires=3)
+		tape = QuantumScript([qml.CNOT(wires=[0, 2])], [qml.sample(wires=[0, 2])], shots=100)
+
+		with patch.object(dev, "_pl_coupling_map", return_value=[(0, 1), (1, 2)]):
+			[tape], _ = dev.preprocess_transforms()((tape,))
+
+		assert [op.name for op in tape.operations] == ["CNOT", "CNOT", "CNOT", "CNOT"]
+
+	def test_broadcasted_parameters_are_expanded_before_execution(self):
+		dev = make_device(wires=3)
+		tape = QuantumScript(
+			[qml.RX(np.array([0.1, 0.2]), wires=0), qml.CNOT(wires=[0, 2])], [qml.expval(qml.PauliZ(0))], shots=100
+		)
+
+		with patch.object(dev, "_pl_coupling_map", return_value=[(0, 1), (1, 2)]):
+			tapes, _ = dev.preprocess_transforms()((tape,))
+
+		assert len(tapes) == 2
+		assert all(tape.batch_size is None for tape in tapes)
+		assert all(op.name != "SWAP" for tape in tapes for op in tape.operations)
+
 
 class TestTranspileWorkaround:
 	"""_transpile must handle tensor-product observables that qml.transforms.transpile rejects."""
@@ -355,7 +378,7 @@ class TestShotsResolution:
 		dev._client = MagicMock()
 		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])], shots=None)
 		with pytest.raises(ValueError, match="shots must be specified"):
-			dev._execute_single(tape)
+			dev.execute((tape,))
 
 	@pytest.mark.parametrize("device_shots,tape_shots,expected", [(100, 32, 32), (64, None, 64)])
 	def test_resolution(self, device_shots, tape_shots, expected):
@@ -365,7 +388,7 @@ class TestShotsResolution:
 		dev = make_device(wires=1, shots=device_shots)
 		dev._client = mock_client
 		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])], shots=tape_shots)
-		dev._execute_single(tape)
+		dev.execute((tape,))
 
 		_, kwargs = mock_client.submit_circuits.call_args
 		assert kwargs.get("shots") == expected
@@ -389,9 +412,38 @@ class TestExecute:
 
 	def test_batch_execute_returns_one_result_per_tape(self):
 		mock_client = MagicMock()
-		dev = self._device_with_completed_job(mock_client, n_shots=4, qubits=["QB1"])
+		measurements = [{"meas_QB1": [[0], [0], [0], [0]]}, {"meas_QB1": [[1], [1], [1], [1]]}]
+		job = make_mock_job([JobStatus.COMPLETED])
+		job.result.return_value = measurements
+		mock_client.submit_circuits.return_value = job
+		dev = make_device(wires=1, shots=4, use_connectivity=False)
+		dev._client = mock_client
 		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])], shots=4)
-		assert len(dev.execute((tape, tape))) == 2
+		first, second = dev.execute((tape, tape))
+
+		np.testing.assert_array_equal(first, np.zeros((4, 1), dtype=int))
+		np.testing.assert_array_equal(second, np.ones((4, 1), dtype=int))
+		mock_client.submit_circuits.assert_called_once()
+		submitted_circuits = mock_client.submit_circuits.call_args.args[0]
+		assert len(submitted_circuits) == 2
+
+	def test_different_shot_counts_are_submitted_separately(self):
+		mock_client = MagicMock()
+		mock_client.submit_circuits.side_effect = [
+			make_completed_job(n_shots=4, qubits=["QB1"]),
+			make_completed_job(n_shots=8, qubits=["QB1"]),
+		]
+		dev = make_device(wires=1, shots=None, use_connectivity=False)
+		dev._client = mock_client
+		tapes = (
+			QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])], shots=4),
+			QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])], shots=8),
+		)
+
+		results = dev.execute(tapes)
+
+		assert [result.shape for result in results] == [(4, 1), (8, 1)]
+		assert [call.kwargs["shots"] for call in mock_client.submit_circuits.call_args_list] == [4, 8]
 
 	def test_star_architecture_invokes_transpile_insert_moves(self, star_dqa):
 		# Star DQA -> Device should call iqm-client's transpile_insert_moves

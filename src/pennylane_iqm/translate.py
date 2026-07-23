@@ -80,9 +80,7 @@ def op_to_iqm(op: qml.operation.Operator, wire_map: WireMap) -> list[CircuitOper
 		case "CNOT":
 			return _cnot_as_cz(wires[0], wires[1])
 		case _:
-			raise ValueError(
-				f"Unsupported gate '{name}' reached translator. Add it to SUPPORTED_OPS and implement the mapping."
-			)
+			raise ValueError(f"Unsupported gate '{name}' reached translator.")
 
 
 def build_wire_map(tape: QuantumScript, device_wires: qml.wires.Wires | None) -> WireMap:
