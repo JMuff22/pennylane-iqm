@@ -223,6 +223,7 @@ class IQMDevice(Device):
 		4. diagonalize_measurements - prepend Z-basis rotation gates
 		5. decompose              - reduce all gates to SUPPORTED_OPS
 		6. transpile (optional)   - SWAP routing to hardware topology
+		7. decompose (if routed)  - reduce routing SWAPs to SUPPORTED_OPS
 		"""
 		program = qml.CompilePipeline()
 
@@ -237,6 +238,7 @@ class IQMDevice(Device):
 		coupling_map = self._pl_coupling_map()
 		if coupling_map is not None:
 			program.add_transform(_transpile, coupling_map=coupling_map)
+			program.add_transform(decompose, stopping_condition=stopping_condition, name=self.name)
 
 		return program
 

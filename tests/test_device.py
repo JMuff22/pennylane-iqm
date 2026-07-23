@@ -214,6 +214,15 @@ class TestPreprocessTransforms:
 		names = [t.tape_transform.__name__ for t in dev.preprocess_transforms()]
 		assert "_transpile" in names
 
+	def test_routing_swaps_are_decomposed_before_execution(self):
+		dev = make_device(wires=3)
+		tape = QuantumScript([qml.CNOT(wires=[0, 2])], [qml.sample(wires=[0, 2])], shots=100)
+
+		with patch.object(dev, "_pl_coupling_map", return_value=[(0, 1), (1, 2)]):
+			[tape], _ = dev.preprocess_transforms()((tape,))
+
+		assert [op.name for op in tape.operations] == ["CNOT", "CNOT", "CNOT", "CNOT"]
+
 
 class TestTranspileWorkaround:
 	"""_transpile must handle tensor-product observables that qml.transforms.transpile rejects."""
