@@ -14,6 +14,7 @@ from iqm.iqm_client import IQMClient
 from iqm.iqm_client.iqm_client import CircuitJob
 from iqm.iqm_client.models import CircuitCompilationOptions
 from iqm.iqm_client.transpile import transpile_insert_moves
+from iqm.pulse.circuit_operations import Circuit
 from iqm.iqm_server_client.models import JobStatus
 from iqm.station_control.interface.models import CircuitMeasurementResultsBatch, DynamicQuantumArchitecture
 from pennylane.devices import Device, ExecutionConfig
@@ -25,7 +26,17 @@ from pennylane.typing import Result
 
 from .gates import stopping_condition
 from .result import iqm_result_to_samples
-from .translate import build_wire_map, tape_to_iqm_circuit
+from .translate import WireMap, build_wire_map, tape_to_iqm_circuit
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedCircuit:
+	index: int
+	tape: QuantumScript
+	circuit: Circuit
+	wire_map: WireMap
+	measured_wires: list[Hashable]
+	shots: int
 
 
 @qml.transform
@@ -224,6 +235,7 @@ class IQMDevice(Device):
 		5. decompose              - reduce all gates to SUPPORTED_OPS
 		6. transpile (optional)   - SWAP routing to hardware topology
 		7. decompose (if routed)  - reduce routing SWAPs to SUPPORTED_OPS
+		8. broadcast_expand       - split parameter batches into scalar tapes
 		"""
 		program = qml.CompilePipeline()
 
@@ -239,6 +251,8 @@ class IQMDevice(Device):
 		if coupling_map is not None:
 			program.add_transform(_transpile, coupling_map=coupling_map)
 			program.add_transform(decompose, stopping_condition=stopping_condition, name=self.name)
+
+		program.add_transform(qml.transforms.broadcast_expand)
 
 		return program
 
@@ -256,13 +270,36 @@ class IQMDevice(Device):
 		"""Execute one or more QuantumScripts on IQM hardware.
 
 		``single_tape_support`` wraps single-tape calls into a batch before this
-		method runs, so ``circuits`` is always a sequence at runtime.
+		method runs, so ``circuits`` is always a sequence at runtime. Circuits
+		with the same shot count are submitted together in one IQM job.
 		"""
 		batch = [circuits] if isinstance(circuits, QuantumScript) else circuits
-		return tuple(self._execute_single(tape) for tape in batch)
+		prepared = [self._prepare_circuit(index, tape) for index, tape in enumerate(batch)]
 
-	def _execute_single(self, tape: QuantumScript) -> Result:
-		"""Translate, submit, poll, and decode one QuantumScript."""
+		shot_groups: dict[int, list[_PreparedCircuit]] = {}
+		for item in prepared:
+			shot_groups.setdefault(item.shots, []).append(item)
+
+		results: dict[int, Result] = {}
+		for shots, items in shot_groups.items():
+			job = self.client.submit_circuits(
+				[item.circuit for item in items], shots=shots, qubit_mapping=self._qubit_mapping, options=self._options
+			)
+			batch_result = self._wait_for_job(job)
+			if len(batch_result) != len(items):
+				raise RuntimeError(
+					f"IQM job {job.job_id} returned {len(batch_result)} circuit results "
+					f"for {len(items)} submitted circuits."
+				)
+
+			for item, measurements in zip(items, batch_result, strict=True):
+				samples = iqm_result_to_samples(measurements, item.wire_map, item.measured_wires)
+				results[item.index] = self._postprocess(item.tape, samples, item.measured_wires)
+
+		return tuple(results[index] for index in range(len(prepared)))
+
+	def _prepare_circuit(self, index: int, tape: QuantumScript) -> _PreparedCircuit:
+		"""Translate one QuantumScript and retain the metadata needed to decode its result."""
 		wire_map = build_wire_map(tape, self.wires)
 		measured_wires = self._collect_measured_wires(tape)
 
@@ -279,16 +316,7 @@ class IQMDevice(Device):
 				"or as a device default (IQMDevice(..., shots=1024))."
 			)
 
-		job = self.client.submit_circuits(
-			[circuit], shots=shots, qubit_mapping=self._qubit_mapping, options=self._options
-		)
-		# result() returns CircuitMeasurementResultsBatch = list[dict[str, list[list[int]]]]
-		# one dict per submitted circuit; we always submit exactly one circuit.
-		batch_result = self._wait_for_job(job)
-		measurements = batch_result[0]
-
-		samples = iqm_result_to_samples(measurements, wire_map, measured_wires)
-		return self._postprocess(tape, samples, measured_wires)
+		return _PreparedCircuit(index, tape, circuit, wire_map, measured_wires, shots)
 
 	def _collect_measured_wires(self, tape: QuantumScript) -> list[Hashable]:
 		"""Return ordered, deduplicated list of wires that need measure instructions."""
