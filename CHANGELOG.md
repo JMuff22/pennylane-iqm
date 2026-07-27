@@ -1,3 +1,7 @@
+## [0.4.0] - 27.07.2026
+
+- Add `_optimize_single_qubit_gates` in `translate.py` to merge single qubit gate operations when translating pennylane tapes to IQM circuits.
+
 ## [0.3.0] - 27.07.2026
 
 - Add `_translate_circuit` to `device.py` to translate a preprocessed pennylane circuit
