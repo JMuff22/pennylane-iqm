@@ -224,6 +224,32 @@ class IQMDevice(Device):
 		"""Return False to delegate gradient computation to PennyLane transforms."""
 		return False
 
+	def to_iqm_circuits(self, tape: QuantumScript, circuit_name: str = "pennylane_circuit") -> tuple[Circuit, ...]:
+		"""Convert a PennyLane tape into IQM circuits without executing it.
+
+		The device preprocessing pipeline decomposes, diagonalizes, broadcasts,
+		and routes the tape exactly as it does before hardware execution. A single
+		PennyLane tape can therefore produce more than one IQM circuit.
+
+		Args:
+			tape: PennyLane tape to preprocess and translate.
+			circuit_name: Base name for the IQM circuits. When preprocessing
+				produces multiple circuits, their zero-based index is appended.
+
+		Returns:
+			IQM circuits ready for IQM Client submission or Pulla compilation.
+		"""
+		program, _ = self.preprocess()
+		preprocessed_tapes, _ = program(tape)
+		multiple_circuits = len(preprocessed_tapes) > 1
+
+		circuits = []
+		for index, preprocessed_tape in enumerate(preprocessed_tapes):
+			name = f"{circuit_name}_{index}" if multiple_circuits else circuit_name
+			circuit, _, _ = self._translate_circuit(preprocessed_tape, name)
+			circuits.append(circuit)
+		return tuple(circuits)
+
 	def preprocess_transforms(self, execution_config: ExecutionConfig | None = None) -> qml.CompilePipeline:
 		"""Build the compilation pipeline for IQM hardware.
 
@@ -300,14 +326,7 @@ class IQMDevice(Device):
 
 	def _prepare_circuit(self, index: int, tape: QuantumScript) -> _PreparedCircuit:
 		"""Translate one QuantumScript and retain the metadata needed to decode its result."""
-		wire_map = build_wire_map(tape, self.wires)
-		measured_wires = self._collect_measured_wires(tape)
-
-		circuit = tape_to_iqm_circuit(tape, wire_map)
-
-		dqa = self.architecture
-		if dqa is not None and dqa.computational_resonators:
-			circuit = transpile_insert_moves(circuit, dqa)
+		circuit, wire_map, measured_wires = self._translate_circuit(tape)
 
 		shots = tape.shots.total_shots if tape.shots else self._default_shots
 		if shots is None:
@@ -317,6 +336,21 @@ class IQMDevice(Device):
 			)
 
 		return _PreparedCircuit(index, tape, circuit, wire_map, measured_wires, shots)
+
+	def _translate_circuit(
+		self, tape: QuantumScript, circuit_name: str = "pennylane_circuit"
+	) -> tuple[Circuit, WireMap, list[Hashable]]:
+		"""Translate a preprocessed tape and retain its measurement metadata."""
+		wire_map = build_wire_map(tape, self.wires)
+		measured_wires = self._collect_measured_wires(tape)
+
+		circuit = tape_to_iqm_circuit(tape, wire_map, circuit_name)
+
+		dqa = self.architecture
+		if dqa is not None and dqa.computational_resonators:
+			circuit = transpile_insert_moves(circuit, dqa)
+
+		return circuit, wire_map, measured_wires
 
 	def _collect_measured_wires(self, tape: QuantumScript) -> list[Hashable]:
 		"""Return ordered, deduplicated list of wires that need measure instructions."""
