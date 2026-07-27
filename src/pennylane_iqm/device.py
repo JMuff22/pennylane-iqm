@@ -176,6 +176,33 @@ class IQMDevice(Device):
 		dqa = self.architecture
 		return dqa is not None and bool(dqa.computational_resonators)
 
+	def _wire_map(self, tape: QuantumScript | None = None) -> WireMap:
+		"""Map device wires to circuit qubit names."""
+		dqa = self.architecture
+		iqm_qubits = dqa.qubits if dqa is not None and self._qubit_mapping is None else None
+		return build_wire_map(tape, self.wires, iqm_qubits)
+
+	def _physical_wire_map(self) -> WireMap:
+		"""Map device wires to the physical qubits used for routing."""
+		wire_map = self._wire_map()
+		if self._qubit_mapping is None:
+			return wire_map
+
+		missing = set(wire_map.values()) - self._qubit_mapping.keys()
+		if missing:
+			raise ValueError(f"qubit_mapping does not contain the circuit qubits {sorted(missing)}.")
+
+		physical_wire_map = {wire: self._qubit_mapping[logical] for wire, logical in wire_map.items()}
+		if len(set(physical_wire_map.values())) != len(physical_wire_map):
+			raise ValueError("qubit_mapping must map circuit qubits to distinct physical qubits.")
+
+		dqa = self.architecture
+		if dqa is not None:
+			unknown = set(physical_wire_map.values()) - set(dqa.qubits)
+			if unknown:
+				raise ValueError(f"qubit_mapping contains physical qubits absent from the DQA: {sorted(unknown)}.")
+		return physical_wire_map
+
 	def _pl_coupling_map(self) -> list[tuple] | None:
 		"""Derive a PennyLane coupling map from the DQA's CZ loci.
 
@@ -187,8 +214,7 @@ class IQMDevice(Device):
 		if dqa is None or "cz" not in dqa.gates:
 			return None
 
-		wire_labels = list(self.wires)
-		iqm_to_pl = {f"QB{idx + 1}": w for idx, w in enumerate(wire_labels)}
+		iqm_to_pl = {iqm: wire for wire, iqm in self._physical_wire_map().items()}
 
 		coupling: list[tuple] = []
 		for locus in dqa.gates["cz"].loci:
@@ -341,7 +367,7 @@ class IQMDevice(Device):
 		self, tape: QuantumScript, circuit_name: str = "pennylane_circuit"
 	) -> tuple[Circuit, WireMap, list[Hashable]]:
 		"""Translate a preprocessed tape and retain its measurement metadata."""
-		wire_map = build_wire_map(tape, self.wires)
+		wire_map = self._wire_map(tape)
 		measured_wires = self._collect_measured_wires(tape)
 
 		circuit = tape_to_iqm_circuit(tape, wire_map, circuit_name)

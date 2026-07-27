@@ -143,24 +143,41 @@ class TestOpToIqmTwoQubit:
 class TestBuildWireMap:
 	def test_integer_wires(self):
 		tape = QuantumScript([qml.PauliX(wires=0), qml.PauliX(wires=1)], [qml.sample(wires=[0, 1])])
-		wmap = build_wire_map(tape, qml.wires.Wires([0, 1]))
+		wmap = build_wire_map(tape, qml.wires.Wires([0, 1]), ["QB1", "QB2"])
 		assert wmap == {0: "QB1", 1: "QB2"}
 
 	def test_string_wires(self):
 		tape = QuantumScript([qml.PauliX(wires="a")], [qml.sample(wires=["a"])])
-		wmap = build_wire_map(tape, qml.wires.Wires(["a", "b", "c"]))
+		wmap = build_wire_map(tape, qml.wires.Wires(["a", "b", "c"]), ["QB1", "QB2", "QB3"])
 		assert wmap == {"a": "QB1", "b": "QB2", "c": "QB3"}
 
 	def test_no_device_wires_falls_back_to_tape(self):
 		tape = QuantumScript([qml.PauliX(wires=3), qml.PauliX(wires=5)], [qml.sample(wires=[3, 5])])
-		assert build_wire_map(tape, None) == {3: "QB1", 5: "QB2"}
+		with pytest.warns(UserWarning, match="not validated against a physical IQM backend"):
+			assert build_wire_map(tape, None) == {3: "QB1", 5: "QB2"}
 
 	def test_device_wires_override_tape_order(self):
-		# Device-wires ordering is what determines QB numbering, even when the
-		# tape applies gates in a different order.
+		# Device-wires ordering determines the mapping even when the tape
+		# applies gates in a different order.
 		tape = QuantumScript([qml.PauliX(wires=1), qml.PauliX(wires=0)], [qml.sample(wires=[0, 1])])
-		wmap = build_wire_map(tape, qml.wires.Wires([0, 1]))
+		wmap = build_wire_map(tape, qml.wires.Wires([0, 1]), ["QB1", "QB2"])
 		assert wmap == {0: "QB1", 1: "QB2"}
+
+	def test_physical_qubit_names_are_used(self):
+		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0, 1])])
+		wmap = build_wire_map(tape, qml.wires.Wires([0, 1]), ["QB1", "QB3"])
+		assert wmap == {0: "QB1", 1: "QB3"}
+
+	@pytest.mark.parametrize("iqm_qubits", [None, []])
+	def test_generated_qubit_names_warn(self, iqm_qubits):
+		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])])
+		with pytest.warns(UserWarning, match=r"generated QB\{i \+ 1\} names"):
+			assert build_wire_map(tape, qml.wires.Wires([0]), iqm_qubits) == {0: "QB1"}
+
+	def test_too_few_physical_qubits_raises(self):
+		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0, 1])])
+		with pytest.raises(ValueError, match="Cannot map 2 PennyLane wires to the 1 provided IQM qubit names"):
+			build_wire_map(tape, qml.wires.Wires([0, 1]), ["QB1"])
 
 
 class TestTapeToIqmCircuit:
