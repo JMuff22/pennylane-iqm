@@ -1,3 +1,10 @@
+## [0.3.0] - 27.07.2026
+
+- Add `_translate_circuit` to `device.py` to translate a preprocessed pennylane circuit
+- Add `device.to_iqm_circuits` to convert a PennyLane tape into IQM circuits without executing it
+- Add a Demo notebook demonstrating how pennylane-iqm can be used to convert a Pennylane tape into a Pulla playlist and visualise it.
+
+
 ## [0.2.0] - 23.07.2026
 
 - Fix: Add decomposition transformation to fix additional SWAPs being added
