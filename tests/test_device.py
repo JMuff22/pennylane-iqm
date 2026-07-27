@@ -238,6 +238,28 @@ class TestPreprocessTransforms:
 		assert all(op.name != "SWAP" for tape in tapes for op in tape.operations)
 
 
+class TestToIQMCircuits:
+	def test_preprocesses_and_translates_without_execution(self):
+		dev = make_device(wires=2, shots=None)
+		tape = QuantumScript(
+			[qml.Rot(0.1, 0.2, 0.3, wires=0), qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100
+		)
+
+		(circuit,) = dev.to_iqm_circuits(tape, circuit_name="bell")
+
+		assert circuit.name == "bell"
+		assert {instruction.name for instruction in circuit.instructions} <= {"prx", "cz", "measure"}
+		assert [instruction.name for instruction in circuit.instructions[-2:]] == ["measure", "measure"]
+
+	def test_names_circuits_created_by_broadcast_expansion(self):
+		dev = make_device(wires=1)
+		tape = QuantumScript([qml.RX(np.array([0.1, 0.2]), wires=0)], [qml.sample(wires=[0])], shots=100)
+
+		circuits = dev.to_iqm_circuits(tape, circuit_name="sweep")
+
+		assert [circuit.name for circuit in circuits] == ["sweep_0", "sweep_1"]
+
+
 class TestTranspileWorkaround:
 	"""_transpile must handle tensor-product observables that qml.transforms.transpile rejects."""
 
