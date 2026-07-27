@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Hashable, Sequence
 from math import pi
 
@@ -164,22 +165,46 @@ def op_to_iqm(op: qml.operation.Operator, wire_map: WireMap) -> list[CircuitOper
 			raise ValueError(f"Unsupported gate '{name}' reached translator.")
 
 
-def build_wire_map(tape: QuantumScript, device_wires: qml.wires.Wires | None) -> WireMap:
-	"""Map PennyLane wire labels to IQM qubit names (QB1, QB2, ...).
-
-	The i-th wire maps to ``QB{i+1}``, consistent with _pl_coupling_map.
+def build_wire_map(
+	tape: QuantumScript | None, device_wires: qml.wires.Wires | None, iqm_qubits: Sequence[str] | None = None
+) -> WireMap:
+	"""Map PennyLane wire labels to IQM qubit names.
 
 	Args:
 		tape: Quantum tape providing fallback wire ordering when device_wires
-			is None.
+			is None. May be None when device_wires is provided.
 		device_wires: Authoritative wire ordering. When provided, the mapping
 			follows this order; otherwise it falls back to the tape's wires.
+		iqm_qubits: Physical qubit names in mapping order. When omitted,
+			logical names ``QB1``, ``QB2``, ... are generated for offline
+			translation or use with an IQM Client qubit mapping.
 
 	Returns:
 		Mapping from PennyLane wire labels to IQM qubit names.
+
+	Raises:
+		ValueError: If neither device nor tape wires are available, or if there
+			are fewer IQM qubits than PennyLane wires.
 	"""
-	ordered = list(device_wires) if device_wires is not None else list(tape.wires)
-	return {w: f"QB{i + 1}" for i, w in enumerate(ordered)}
+	if device_wires is not None:
+		ordered = list(device_wires)
+	elif tape is not None:
+		ordered = list(tape.wires)
+	else:
+		raise ValueError("Cannot build a wire map without device wires or a quantum tape.")
+
+	if iqm_qubits is None or len(iqm_qubits) == 0:
+		warnings.warn(
+			"iqm_qubits was not provided; generated QB{i + 1} names are not validated against a physical IQM backend.",
+			UserWarning,
+			stacklevel=2,
+		)
+		qubits = [f"QB{i + 1}" for i in range(len(ordered))]
+	else:
+		qubits = list(iqm_qubits)
+	if len(qubits) < len(ordered):
+		raise ValueError(f"Cannot map {len(ordered)} PennyLane wires to the {len(qubits)} provided IQM qubit names.")
+	return dict(zip(ordered, qubits, strict=False))
 
 
 def tape_to_iqm_circuit(tape: QuantumScript, wire_map: WireMap, circuit_name: str = "pennylane_circuit") -> Circuit:

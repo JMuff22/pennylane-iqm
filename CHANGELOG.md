@@ -1,3 +1,7 @@
+## [0.4.1] - 27.07.2026
+
+- Fix wire mapping issue that caused the translation to use qubits that didn't exist on the backend.
+
 ## [0.4.0] - 27.07.2026
 
 - Add `_optimize_single_qubit_gates` in `translate.py` to merge single qubit gate operations when translating pennylane tapes to IQM circuits. Circuits submitted should now contain fewer gates and a shorter duration.
