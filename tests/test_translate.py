@@ -4,13 +4,22 @@ from __future__ import annotations
 
 from math import pi
 
+import numpy as np
 import pennylane as qml
 import pytest
 from pennylane.tape import QuantumScript
 
 from iqm.pulse.builder import CircuitOperation
 
-from pennylane_iqm.translate import _hadamard_as_prx, _prx, _rz_as_prx, build_wire_map, op_to_iqm, tape_to_iqm_circuit
+from pennylane_iqm.translate import (
+	_hadamard_as_prx,
+	_optimize_single_qubit_gates,
+	_prx,
+	_rz_as_prx,
+	build_wire_map,
+	op_to_iqm,
+	tape_to_iqm_circuit,
+)
 
 
 WIRE_MAP_2Q = {0: "QB1", 1: "QB2"}
@@ -190,3 +199,98 @@ class TestTapeToIqmCircuit:
 		tape = QuantumScript([], [qml.sample(wires=[0])])
 		ops = list(tape_to_iqm_circuit(tape, self.WIRE_MAP).instructions)
 		assert all(o.name == "measure" for o in ops)
+
+	def test_cnot_uses_one_prx_on_each_side_of_cz(self):
+		tape = QuantumScript([qml.RY(0.37, wires=0), qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])])
+
+		ops = list(tape_to_iqm_circuit(tape, self.WIRE_MAP).instructions)
+		cz_index = next(index for index, op in enumerate(ops) if op.name == "cz")
+		target_prx_before = [op for op in ops[:cz_index] if op.name == "prx" and op.locus == ("QB2",)]
+		target_prx_after = [op for op in ops[cz_index + 1 :] if op.name == "prx" and op.locus == ("QB2",)]
+
+		assert len(target_prx_before) == 1
+		assert len(target_prx_after) == 1
+		assert target_prx_before[0].args["angle"] == pytest.approx(pi / 2)
+		assert target_prx_after[0].args["angle"] == pytest.approx(pi / 2)
+		assert sum(op.name == "prx" for op in ops) == 3
+
+	def test_adjacent_single_qubit_gates_fuse_to_one_prx(self):
+		tape = QuantumScript(
+			[qml.RX(0.2, wires=0), qml.RY(0.3, wires=0), qml.RZ(0.4, wires=0)], [qml.sample(wires=[0])]
+		)
+
+		ops = tape_to_iqm_circuit(tape, self.WIRE_MAP).instructions
+
+		assert [op.name for op in ops] == ["prx", "measure"]
+
+	def test_terminal_rz_is_virtual(self):
+		tape = QuantumScript([qml.RZ(0.4, wires=0)], [qml.sample(wires=[0])])
+
+		ops = tape_to_iqm_circuit(tape, self.WIRE_MAP).instructions
+
+		assert [op.name for op in ops] == ["measure"]
+
+
+class TestOptimizeSingleQubitGates:
+	@staticmethod
+	def mixed_instructions() -> tuple[CircuitOperation, ...]:
+		operations = [
+			qml.Hadamard(wires=0),
+			qml.RZ(0.23, wires=0),
+			qml.RX(-0.41, wires=1),
+			qml.CNOT(wires=[0, 1]),
+			qml.RY(0.67, wires=0),
+			qml.S(wires=1),
+			qml.CZ(wires=[0, 1]),
+			qml.T(wires=0),
+			qml.Hadamard(wires=1),
+		]
+		return tuple(instruction for operation in operations for instruction in op_to_iqm(operation, WIRE_MAP_2Q))
+
+	@staticmethod
+	def circuit_matrix(instructions: list[CircuitOperation] | tuple[CircuitOperation, ...]) -> np.ndarray:
+		operations = []
+		wire_map = {"QB1": 0, "QB2": 1}
+		for instruction in instructions:
+			if instruction.name == "prx":
+				angle = instruction.args["angle"]
+				phase = instruction.args["phase"]
+				cosine = np.cos(angle / 2)
+				sine = np.sin(angle / 2)
+				matrix = np.array(
+					[[cosine, -1j * np.exp(-1j * phase) * sine], [-1j * np.exp(1j * phase) * sine, cosine]]
+				)
+				operations.append(qml.QubitUnitary(matrix, wires=wire_map[instruction.locus[0]]))
+			elif instruction.name == "cz":
+				operations.append(qml.CZ(wires=[wire_map[qubit] for qubit in instruction.locus]))
+		tape = QuantumScript(operations)
+		return qml.matrix(tape, wire_order=[0, 1])
+
+	def test_preserves_unitary_when_final_rz_is_kept(self):
+		instructions = self.mixed_instructions()
+
+		original = self.circuit_matrix(instructions)
+		optimized = self.circuit_matrix(_optimize_single_qubit_gates(instructions, drop_final_rz=False))
+		relative = original @ optimized.conj().T
+		global_phase = relative[0, 0]
+
+		assert abs(global_phase) == pytest.approx(1.0)
+		assert relative == pytest.approx(global_phase * np.eye(4), abs=1e-9)
+
+	def test_dropped_final_rz_preserves_measurement_probabilities(self):
+		instructions = self.mixed_instructions()
+
+		original = self.circuit_matrix(instructions)
+		optimized = self.circuit_matrix(_optimize_single_qubit_gates(instructions))
+		rng = np.random.default_rng(1234)
+		states = rng.normal(size=(5, 4)) + 1j * rng.normal(size=(5, 4))
+		states /= np.linalg.norm(states, axis=1, keepdims=True)
+
+		for state in states:
+			assert np.abs(optimized @ state) ** 2 == pytest.approx(np.abs(original @ state) ** 2)
+
+	def test_rejects_non_native_instruction(self):
+		measure = CircuitOperation("measure", locus=("QB1",), args={"key": "m"})
+
+		with pytest.raises(ValueError, match="Unexpected operation 'measure'"):
+			_optimize_single_qubit_gates([measure])
