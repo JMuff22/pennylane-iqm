@@ -16,6 +16,7 @@ from iqm.iqm_client.models import CircuitCompilationOptions
 from iqm.iqm_client.transpile import transpile_insert_moves
 from iqm.pulse.circuit_operations import Circuit
 from iqm.iqm_server_client.models import JobStatus
+from iqm.station_control.client.qon import ObservationFinder
 from iqm.station_control.interface.models import CircuitMeasurementResultsBatch, DynamicQuantumArchitecture
 from pennylane.devices import Device, ExecutionConfig
 from pennylane.devices.modifiers import simulator_tracking, single_tape_support
@@ -25,6 +26,7 @@ from pennylane.tape import QuantumScript
 from pennylane.typing import Result
 
 from .gates import stopping_condition
+from .layout import _DEFAULT_MAX_CANDIDATES, _map_tape, _select_initial_layout, _transpile
 from .result import iqm_result_to_samples
 from .translate import WireMap, build_wire_map, tape_to_iqm_circuit
 
@@ -40,41 +42,20 @@ class _PreparedCircuit:
 
 
 @qml.transform
-def _transpile(tape: QuantumScript, coupling_map: list[tuple[Hashable, Hashable]]) -> tuple:
-	"""Like qml.transforms.transpile but supports tensor-product and Hamiltonian measurements.
+def _optimized_transpile(
+	tape: QuantumScript, dqa: DynamicQuantumArchitecture, metrics: ObservationFinder | None, max_candidates: int
+) -> tuple:
+	"""Select physical qubits using topology and optional quality metrics."""
+	selected_layout, coupling_map = _select_initial_layout(tape, dqa, metrics, max_candidates)
+	mapped_tape = _map_tape(tape, selected_layout)
 
-	PennyLane's built-in transpile raises NotImplementedError for Prod/LinearCombination
-	observables even though routing only depends on gate connectivity, not measurements.
+	if not any(len(operation.wires) == 2 for operation in mapped_tape.operations):
+		return [mapped_tape], lambda results: results[0]
 
-	Fix: route a proxy tape whose measurements are a single qml.probs over all wires
-	(which transpile accepts), derive the wire permutation from how those proxy wires
-	changed, then apply the same permutation to the original measurements.
-	"""
-	complex_obs = (qml.ops.Prod, qml.ops.LinearCombination)
-	needs_workaround = any(isinstance(getattr(m, "obs", None), complex_obs) for m in tape.measurements)
-
-	# `qml.transforms.transpile` is a Transform; .tape_transform is the
-	# underlying function, typed `Callable | None`. It is never None for
-	# the upstream transpile transform, but narrow explicitly.
-	transpile_tape = qml.transforms.transpile.tape_transform
+	transpile_tape = _transpile.tape_transform
 	if transpile_tape is None:
-		raise RuntimeError("qml.transforms.transpile.tape_transform is unexpectedly None")
-
-	if not needs_workaround:
-		return transpile_tape(tape, coupling_map=coupling_map)
-
-	orig_wires = list(tape.wires)
-	proxy_tape = qml.tape.QuantumScript(tape.operations, [qml.probs(wires=orig_wires)], shots=tape.shots)
-	routed_batch, fn = transpile_tape(proxy_tape, coupling_map=coupling_map)
-	[routed] = routed_batch
-
-	# Derive the wire permutation that routing applied from the proxy measurement
-	new_wires = list(routed.measurements[0].wires)
-	wire_map = {o: n for o, n in zip(orig_wires, new_wires)}
-	remapped_mps = [m.map_wires(wire_map) for m in tape.measurements]
-
-	final_tape = qml.tape.QuantumScript(routed.operations, remapped_mps, shots=tape.shots)
-	return [final_tape], fn
+		raise RuntimeError("_transpile.tape_transform is unexpectedly None")
+	return transpile_tape(mapped_tape, coupling_map=coupling_map)
 
 
 @simulator_tracking
@@ -94,6 +75,14 @@ class IQMDevice(Device):
 	    poll_interval: Seconds between job-status polls (default 2).
 	    timeout: Max wait seconds for a job (default 300).
 	    use_connectivity: Fetch DQA and enforce routing (default True).
+	    optimize_layout: Select a circuit-aware initial layout from the DQA
+		    topology. Native zero-SWAP embeddings take priority; routed layouts
+		    minimize emitted CZ gates. Requires use_connectivity=True and no
+		    qubit_mapping. Defaults to True.
+	    use_metrics: Select a circuit-aware initial layout using calibration
+		    quality metrics. Implies optimize_layout=True.
+	    max_candidates: Maximum complete layouts scored in each optimized
+		    search phase. Defaults to 10000.
 	"""
 
 	name = "iqm.direct"
@@ -109,9 +98,18 @@ class IQMDevice(Device):
 		use_connectivity: bool = True,
 		options: CircuitCompilationOptions | None = None,
 		qubit_mapping: dict[str, str] | None = None,
+		use_metrics: bool = False,
+		max_candidates: int = _DEFAULT_MAX_CANDIDATES,
+		optimize_layout: bool = True,
 	):
 		if shots is not None and shots < 1:
 			raise ValueError("IQMDevice requires shots >= 1 (hardware execution).")
+		if (optimize_layout or use_metrics) and not use_connectivity:
+			raise ValueError("Layout optimization requires use_connectivity=True.")
+		if (optimize_layout or use_metrics) and qubit_mapping is not None:
+			raise ValueError("Layout optimization cannot be combined with qubit_mapping.")
+		if max_candidates < 1:
+			raise ValueError("max_candidates must be at least 1.")
 
 		self._server_url = server_url
 		# Only forward an explicit token to IQMClient.
@@ -124,9 +122,13 @@ class IQMDevice(Device):
 		self._default_shots = shots
 		self._options = options
 		self._qubit_mapping = qubit_mapping
+		self._optimize_layout = optimize_layout or use_metrics
+		self._use_metrics = use_metrics
+		self._max_candidates = max_candidates
 
 		self._client: IQMClient | None = None
 		self._dqa: DynamicQuantumArchitecture | None = None
+		self._metrics: ObservationFinder | None = None
 
 		if wires is None:
 			if not use_connectivity:
@@ -136,9 +138,9 @@ class IQMDevice(Device):
 				self._dqa = self.client.get_dynamic_quantum_architecture()
 				wires = len(self._dqa.qubits)
 			except (RuntimeError, OSError, ValueError) as exc:
-				raise ValueError(f"Could not auto-detect wires from server: {exc}") from exc
+				raise RuntimeError(f"Could not auto-detect wires from server: {exc}") from exc
 
-		# Do NOT pass shots to super().__init__ — PennyLane deprecated that.
+		# Do NOT pass shots to super().__init__ — due to Pennylane deprecation
 		# Shots are managed per-QNode or via _default_shots.
 		super().__init__(wires=wires)
 
@@ -176,9 +178,41 @@ class IQMDevice(Device):
 		dqa = self.architecture
 		return dqa is not None and bool(dqa.computational_resonators)
 
+	@property
+	def metrics(self) -> ObservationFinder | None:
+		"""Return calibration quality metrics used for initial layout selection.
+
+		Returns:
+			Quality metrics for the DQA calibration set, or None when metric-based
+			layout selection is disabled.
+
+		Raises:
+			RuntimeError: If metrics are enabled but no DQA is available.
+		"""
+		if not self._use_metrics:
+			return None
+		_, metrics = self._layout_context()
+		return metrics
+
+	def _layout_context(self) -> tuple[DynamicQuantumArchitecture, ObservationFinder | None]:
+		"""Return the DQA and optional metrics required by layout optimization."""
+		dqa = self.architecture
+		if dqa is None:
+			raise RuntimeError("Cannot optimize layout without a dynamic quantum architecture.")
+		if self._use_metrics and self._metrics is None:
+			self._metrics = self.client.get_calibration_quality_metrics(dqa.calibration_set_id)
+		return dqa, self._metrics
+
 	def _wire_map(self, tape: QuantumScript | None = None) -> WireMap:
 		"""Map device wires to circuit qubit names."""
 		dqa = self.architecture
+		if self._optimize_layout and tape is not None:
+			if dqa is None:
+				raise RuntimeError("Cannot translate an optimized layout without a dynamic quantum architecture.")
+			unknown = set(tape.wires) - set(dqa.qubits)
+			if unknown:
+				raise RuntimeError(f"Layout preprocessing did not map wires to physical IQM qubits: {unknown}.")
+			return {wire: str(wire) for wire in tape.wires}
 		iqm_qubits = dqa.qubits if dqa is not None and self._qubit_mapping is None else None
 		return build_wire_map(tape, self.wires, iqm_qubits)
 
@@ -285,9 +319,9 @@ class IQMDevice(Device):
 		3. split_non_commuting    - one tape per commuting observable group
 		4. diagonalize_measurements - prepend Z-basis rotation gates
 		5. decompose              - reduce all gates to SUPPORTED_OPS
-		6. transpile (optional)   - SWAP routing to hardware topology
-		7. decompose (if routed)  - reduce routing SWAPs to SUPPORTED_OPS
-		8. broadcast_expand       - split parameter batches into scalar tapes
+		6. broadcast_expand       - split parameter batches before metric scoring
+		7. transpile (optional)   - layout selection and SWAP routing
+		8. decompose (if routed)  - reduce routing SWAPs to SUPPORTED_OPS
 		"""
 		program = qml.CompilePipeline()
 
@@ -299,12 +333,17 @@ class IQMDevice(Device):
 		program.add_transform(qml.transforms.diagonalize_measurements)
 		program.add_transform(decompose, stopping_condition=stopping_condition, name=self.name)
 
-		coupling_map = self._pl_coupling_map()
-		if coupling_map is not None:
-			program.add_transform(_transpile, coupling_map=coupling_map)
+		if self._optimize_layout:
+			dqa, metrics = self._layout_context()
+			program.add_transform(qml.transforms.broadcast_expand)
+			program.add_transform(_optimized_transpile, dqa=dqa, metrics=metrics, max_candidates=self._max_candidates)
 			program.add_transform(decompose, stopping_condition=stopping_condition, name=self.name)
-
-		program.add_transform(qml.transforms.broadcast_expand)
+		else:
+			coupling_map = self._pl_coupling_map()
+			if coupling_map is not None:
+				program.add_transform(_transpile, coupling_map=coupling_map)
+				program.add_transform(decompose, stopping_condition=stopping_condition, name=self.name)
+			program.add_transform(qml.transforms.broadcast_expand)
 
 		return program
 
@@ -334,9 +373,21 @@ class IQMDevice(Device):
 
 		results: dict[int, Result] = {}
 		for shots, items in shot_groups.items():
-			job = self.client.submit_circuits(
-				[item.circuit for item in items], shots=shots, qubit_mapping=self._qubit_mapping, options=self._options
-			)
+			if self._optimize_layout and self._dqa is not None:
+				job = self.client.submit_circuits(
+					[item.circuit for item in items],
+					shots=shots,
+					qubit_mapping=None,
+					calibration_set_id=self._dqa.calibration_set_id,
+					options=self._options,
+				)
+			else:
+				job = self.client.submit_circuits(
+					[item.circuit for item in items],
+					shots=shots,
+					qubit_mapping=self._qubit_mapping,
+					options=self._options,
+				)
 			batch_result = self._wait_for_job(job)
 			if len(batch_result) != len(items):
 				raise RuntimeError(

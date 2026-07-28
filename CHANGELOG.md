@@ -1,3 +1,9 @@
+## [0.5.0] - 28.07.2026
+
+- Add `optimize_layout` in `IQMDevice` which selects a pennylane-circuit aware initial layout based on the DQA, prioritising reducing the number of SWAPs and then number of CZ gates. Defaults to True.
+  - Searching possible layouts uses Rustworkx `vf2_mapping` which is added as a dependency.
+- Add `use_metrics` in IQM which uses IQM's experimental API for getting quality metrics. This selects the initial layout using calibration quality metrics. Defaults to False.
+
 ## [0.4.1] - 27.07.2026
 
 - Fix wire mapping issue that caused the translation to use qubits that didn't exist on the backend.

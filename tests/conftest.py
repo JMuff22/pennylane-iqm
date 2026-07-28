@@ -73,6 +73,34 @@ def star_dqa() -> DynamicQuantumArchitecture:
 	)
 
 
+@pytest.fixture
+def crystal_4q_dqa() -> DynamicQuantumArchitecture:
+	"""4-qubit crystal chain QB1-QB2-QB3-QB4."""
+	qubits = ["QB1", "QB2", "QB3", "QB4"]
+	return DynamicQuantumArchitecture(
+		calibration_set_id=SAMPLE_CALSET_ID,
+		qubits=qubits,
+		computational_resonators=[],
+		gates={
+			"prx": GateInfo(
+				implementations={"drag_gaussian": GateImplementationInfo(loci=tuple((qubit,) for qubit in qubits))},
+				default_implementation="drag_gaussian",
+				override_default_implementation={},
+			),
+			"cz": GateInfo(
+				implementations={"tgss": GateImplementationInfo(loci=(("QB1", "QB2"), ("QB2", "QB3"), ("QB3", "QB4")))},
+				default_implementation="tgss",
+				override_default_implementation={},
+			),
+			"measure": GateInfo(
+				implementations={"constant": GateImplementationInfo(loci=tuple((qubit,) for qubit in qubits))},
+				default_implementation="constant",
+				override_default_implementation={},
+			),
+		},
+	)
+
+
 def make_mock_job(status_sequence, measurements: dict | None = None):
 	"""Return a mock job that cycles through the given status values on .update()."""
 

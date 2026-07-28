@@ -17,6 +17,14 @@ from pennylane_iqm.device import IQMDevice
 from .conftest import make_completed_job, make_mock_job
 
 
+def make_quality_metrics(cz_qb2: float | None = 0.8, cz_qb3: float | None = 0.99) -> MagicMock:
+	"""Return deterministic calibration metrics for the 3-qubit test DQA."""
+	fidelities = {("cz", ("QB1", "QB2")): cz_qb2, ("cz", ("QB1", "QB3")): cz_qb3}
+	metrics = MagicMock()
+	metrics.get_gate_fidelity.side_effect = lambda gate, _implementation, locus: fidelities.get((gate, locus), 0.99)
+	return metrics
+
+
 def make_device(
 	wires: int | list = 3,
 	shots: int | None = 100,
@@ -24,6 +32,8 @@ def make_device(
 	server_url: str = "https://test.iqm.fi",
 	**kwargs,
 ) -> IQMDevice:
+	if not use_connectivity:
+		kwargs.setdefault("optimize_layout", False)
 	return IQMDevice(server_url, wires=wires, shots=shots, use_connectivity=use_connectivity, **kwargs)
 
 
@@ -57,7 +67,27 @@ class TestIQMDeviceInit:
 
 	def test_wires_none_requires_connectivity(self):
 		with pytest.raises(ValueError, match="use_connectivity=False"):
-			IQMDevice("https://x", wires=None, use_connectivity=False)
+			IQMDevice("https://x", wires=None, use_connectivity=False, optimize_layout=False)
+
+	@pytest.mark.parametrize("layout_options", [{"optimize_layout": True}, {"use_metrics": True}])
+	def test_layout_optimization_requires_connectivity(self, layout_options):
+		with pytest.raises(ValueError, match="Layout optimization requires use_connectivity=True"):
+			IQMDevice("https://x", wires=2, use_connectivity=False, **layout_options)
+
+	@pytest.mark.parametrize("layout_options", [{"optimize_layout": True}, {"use_metrics": True}])
+	def test_layout_optimization_cannot_be_combined_with_qubit_mapping(self, layout_options):
+		with pytest.raises(ValueError, match="cannot be combined with qubit_mapping"):
+			IQMDevice(
+				"https://x",
+				wires=2,
+				use_connectivity=True,
+				qubit_mapping={"QB1": "QB2", "QB2": "QB3"},
+				**layout_options,
+			)
+
+	def test_candidate_limit_must_be_positive(self):
+		with pytest.raises(ValueError, match="max_candidates must be at least 1"):
+			IQMDevice("https://x", wires=2, use_metrics=True, max_candidates=0)
 
 	def test_wires_auto_detected_and_cached_from_dqa(self, crystal_3q_dqa):
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
@@ -68,12 +98,12 @@ class TestIQMDeviceInit:
 		assert len(dev.wires) == 3
 		assert dev._dqa is crystal_3q_dqa
 
-	def test_wires_auto_detect_failure_raises_value_error(self):
+	def test_wires_auto_detect_failure_raises_runtime_error(self):
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
 			mock_client = MagicMock()
 			mock_client.get_dynamic_quantum_architecture.side_effect = RuntimeError("unreachable")
 			MockClient.return_value = mock_client
-			with pytest.raises(ValueError, match="Could not auto-detect"):
+			with pytest.raises(RuntimeError, match="Could not auto-detect"):
 				IQMDevice("https://x", wires=None, use_connectivity=True)
 
 	def test_no_deprecation_warning_on_construction(self, recwarn):
@@ -209,11 +239,11 @@ class TestPreprocessTransforms:
 		assert "decompose" in names
 		assert "_transpile" not in names
 
-	def test_transpile_added_when_coupling_map_available(self, mock_client):
+	def test_optimized_transpile_is_enabled_by_default(self, mock_client):
 		dev = make_device(wires=3, use_connectivity=True)
 		dev._client = mock_client
 		names = [t.tape_transform.__name__ for t in dev.preprocess_transforms()]
-		assert "_transpile" in names
+		assert "_optimized_transpile" in names
 
 	def test_routing_swaps_are_decomposed_before_execution(self):
 		dev = make_device(wires=3)
@@ -236,6 +266,315 @@ class TestPreprocessTransforms:
 		assert len(tapes) == 2
 		assert all(tape.batch_size is None for tape in tapes)
 		assert all(op.name != "SWAP" for tape in tapes for op in tape.operations)
+
+
+class TestLayoutOptimization:
+	def test_topology_layout_avoids_unnecessary_swap_without_metrics(self, crystal_4q_dqa):
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = crystal_4q_dqa
+		fixed_device = make_device(wires=3, shots=None, use_connectivity=True, optimize_layout=False)
+		fixed_device._client = mock_client
+		topology_device = make_device(wires=3, shots=None, use_connectivity=True)
+		topology_device._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 2])], [qml.sample(wires=[0, 1, 2])], shots=100)
+
+		(fixed_circuit,) = fixed_device.to_iqm_circuits(tape)
+		(topology_circuit,) = topology_device.to_iqm_circuits(tape)
+
+		fixed_cz = [instruction for instruction in fixed_circuit.instructions if instruction.name == "cz"]
+		topology_cz = [instruction for instruction in topology_circuit.instructions if instruction.name == "cz"]
+		assert len(fixed_cz) == 4
+		assert len(topology_cz) == 1
+		mock_client.get_calibration_quality_metrics.assert_not_called()
+
+	def test_topology_and_quality_native_layouts_emit_the_same_gate_counts(self, crystal_4q_dqa):
+		fidelities = {("cz", ("QB1", "QB2")): 0.5, ("cz", ("QB2", "QB3")): 0.98, ("cz", ("QB3", "QB4")): 0.99}
+		metrics = MagicMock()
+		metrics.get_gate_fidelity.side_effect = lambda gate, _implementation, locus: fidelities.get((gate, locus), 0.99)
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = crystal_4q_dqa
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		topology_device = make_device(wires=3, shots=None, use_connectivity=True, optimize_layout=True)
+		topology_device._client = mock_client
+		quality_device = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True)
+		quality_device._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1]), qml.CNOT(wires=[1, 2])], [qml.sample(wires=[0, 1, 2])], shots=100)
+
+		(topology_circuit,) = topology_device.to_iqm_circuits(tape)
+		(quality_circuit,) = quality_device.to_iqm_circuits(tape)
+
+		topology_instructions = [instruction.name for instruction in topology_circuit.instructions]
+		quality_instructions = [instruction.name for instruction in quality_circuit.instructions]
+		assert topology_instructions == quality_instructions
+		assert {
+			instruction.locus[0] for instruction in topology_circuit.instructions if instruction.name == "measure"
+		} == {"QB1", "QB2", "QB3"}
+		assert {
+			instruction.locus[0] for instruction in quality_circuit.instructions if instruction.name == "measure"
+		} == {"QB2", "QB3", "QB4"}
+
+	def test_metrics_imply_layout_optimization(self, mock_client):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=2, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		assert len([instruction for instruction in circuit.instructions if instruction.name == "cz"]) == 1
+
+	def test_topology_submission_pins_dqa_calibration_set(self, mock_client, crystal_3q_dqa):
+		dev = make_device(wires=2, shots=4, use_connectivity=True, optimize_layout=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=4)
+		program, _ = dev.preprocess()
+		(preprocessed_tape,), _ = program(tape)
+		physical_qubits = list(preprocessed_tape.measurements[0].wires)
+		mock_client.submit_circuits.return_value = make_completed_job(n_shots=4, qubits=physical_qubits)
+
+		dev.execute((preprocessed_tape,))
+
+		_, kwargs = mock_client.submit_circuits.call_args
+		assert kwargs["calibration_set_id"] == crystal_3q_dqa.calibration_set_id
+		assert kwargs["qubit_mapping"] is None
+		mock_client.get_calibration_quality_metrics.assert_not_called()
+
+
+class TestQualityAwareLayout:
+	def test_selects_higher_fidelity_cz_locus(self, mock_client, crystal_3q_dqa):
+		metrics = make_quality_metrics()
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		dev = make_device(wires=2, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		used_qubits = {
+			component
+			for instruction in circuit.instructions
+			for component in instruction.locus
+			if component.startswith("QB")
+		}
+		assert used_qubits == {"QB1", "QB3"}
+		mock_client.get_calibration_quality_metrics.assert_called_once_with(crystal_3q_dqa.calibration_set_id)
+
+	def test_missing_fidelity_excludes_locus(self, mock_client):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics(cz_qb2=None, cz_qb3=0.1)
+		dev = make_device(wires=2, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		assert all("QB2" not in instruction.locus for instruction in circuit.instructions)
+
+	def test_scores_prx_and_measure_fidelities(self, mock_client):
+		fidelities = {
+			("prx", ("QB1",)): 0.99,
+			("measure", ("QB1",)): 0.5,
+			("prx", ("QB2",)): 0.9,
+			("measure", ("QB2",)): 0.99,
+			("prx", ("QB3",)): 0.7,
+			("measure", ("QB3",)): 0.99,
+		}
+		metrics = MagicMock()
+		metrics.get_gate_fidelity.side_effect = lambda gate, _implementation, locus: fidelities.get((gate, locus), 0.99)
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		dev = make_device(wires=1, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.RX(0.2, wires=0)], [qml.sample(wires=[0])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		assert {instruction.locus for instruction in circuit.instructions} == {("QB2",)}
+
+	def test_candidate_feasibility_uses_emitted_native_gates(self, mock_client):
+		fidelities = {
+			("prx", ("QB1",)): None,
+			("measure", ("QB1",)): 0.99,
+			("prx", ("QB2",)): 0.99,
+			("measure", ("QB2",)): 0.8,
+			("prx", ("QB3",)): 0.99,
+			("measure", ("QB3",)): 0.7,
+		}
+		metrics = MagicMock()
+		metrics.get_gate_fidelity.side_effect = lambda gate, _implementation, locus: fidelities.get((gate, locus), 0.99)
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		dev = make_device(wires=1, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.RZ(0.2, wires=0)], [qml.sample(wires=[0])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		assert [(instruction.name, instruction.locus) for instruction in circuit.instructions] == [
+			("measure", ("QB1",))
+		]
+
+	def test_finds_minimum_cost_native_embedding(self, crystal_4q_dqa):
+		fidelities = {("cz", ("QB1", "QB2")): 0.5, ("cz", ("QB2", "QB3")): 0.98, ("cz", ("QB3", "QB4")): 0.99}
+		metrics = MagicMock()
+		metrics.get_gate_fidelity.side_effect = lambda gate, _implementation, locus: fidelities.get((gate, locus), 0.99)
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = crystal_4q_dqa
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		dev = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1]), qml.CNOT(wires=[1, 2])], [qml.sample(wires=[0, 1, 2])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		measurement_loci = [
+			instruction.locus[0] for instruction in circuit.instructions if instruction.name == "measure"
+		]
+		assert measurement_loci == ["QB2", "QB3", "QB4"]
+
+	def test_warns_when_native_search_is_bounded(self, crystal_4q_dqa):
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = crystal_4q_dqa
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=2, shots=None, use_connectivity=True, use_metrics=True, max_candidates=5)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100)
+
+		with pytest.warns(UserWarning, match="best candidate found, not a proven global optimum"):
+			dev.to_iqm_circuits(tape)
+
+	def test_warns_when_routed_search_is_bounded(self, mock_client):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True, max_candidates=1)
+		dev._client = mock_client
+		tape = QuantumScript(
+			[qml.CNOT(wires=[0, 1]), qml.CNOT(wires=[1, 2]), qml.CNOT(wires=[0, 2])],
+			[qml.sample(wires=[0, 1, 2])],
+			shots=100,
+		)
+
+		with pytest.warns(UserWarning, match="best candidate found, not a proven global optimum"):
+			dev.to_iqm_circuits(tape)
+
+	def test_equal_cost_layouts_follow_dqa_order(self, crystal_4q_dqa):
+		metrics = MagicMock()
+		metrics.get_gate_fidelity.return_value = 0.99
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = crystal_4q_dqa
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		dev = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1]), qml.CNOT(wires=[1, 2])], [qml.sample(wires=[0, 1, 2])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		measurement_loci = [
+			instruction.locus[0] for instruction in circuit.instructions if instruction.name == "measure"
+		]
+		assert measurement_loci == ["QB1", "QB2", "QB3"]
+
+	def test_broadcasts_are_expanded_before_layout_scoring(self, mock_client):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=2, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript(
+			[qml.RX(np.array([0.1, 0.2]), wires=0), qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100
+		)
+
+		circuits = dev.to_iqm_circuits(tape)
+
+		assert len(circuits) == 2
+
+	def test_routes_and_scores_when_no_native_embedding_exists(self, mock_client, crystal_3q_dqa):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript(
+			[qml.CNOT(wires=[0, 1]), qml.CNOT(wires=[1, 2]), qml.CNOT(wires=[0, 2])],
+			[qml.sample(wires=[0, 1, 2])],
+			shots=100,
+		)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		valid_cz_loci = {frozenset(locus) for locus in crystal_3q_dqa.gates["cz"].loci}
+		cz_loci = [instruction.locus for instruction in circuit.instructions if instruction.name == "cz"]
+		assert len(cz_loci) > 3
+		assert all(frozenset(locus) in valid_cz_loci for locus in cz_loci)
+
+	def test_routed_layout_avoids_low_fidelity_coupler(self, crystal_4q_dqa):
+		fidelities = {("cz", ("QB1", "QB2")): 0.2, ("cz", ("QB2", "QB3")): 0.99, ("cz", ("QB3", "QB4")): 0.99}
+		metrics = MagicMock()
+		metrics.get_gate_fidelity.side_effect = lambda gate, _implementation, locus: fidelities.get((gate, locus), 0.99)
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = crystal_4q_dqa
+		mock_client.get_calibration_quality_metrics.return_value = metrics
+		dev = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript(
+			[qml.CNOT(wires=[0, 1]), qml.CNOT(wires=[1, 2]), qml.CNOT(wires=[0, 2])],
+			[qml.sample(wires=[0, 1, 2])],
+			shots=100,
+		)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		cz_loci = {frozenset(instruction.locus) for instruction in circuit.instructions if instruction.name == "cz"}
+		assert cz_loci == {frozenset(("QB2", "QB3")), frozenset(("QB3", "QB4"))}
+
+	def test_routed_layout_preserves_output_probabilities(self, mock_client):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=3, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript(
+			[
+				qml.RY(0.3, wires=0),
+				qml.RX(-0.2, wires=1),
+				qml.CNOT(wires=[0, 1]),
+				qml.CNOT(wires=[1, 2]),
+				qml.CNOT(wires=[0, 2]),
+			],
+			[qml.sample(wires=[0, 1, 2])],
+			shots=100,
+		)
+		program, _ = dev.preprocess()
+
+		(routed_tape,), _ = program(tape)
+
+		original_matrix = qml.matrix(QuantumScript(tape.operations), wire_order=tape.wires)
+		routed_wires = routed_tape.measurements[0].wires
+		routed_matrix = qml.matrix(QuantumScript(routed_tape.operations), wire_order=routed_wires)
+		assert np.abs(routed_matrix[:, 0]) ** 2 == pytest.approx(np.abs(original_matrix[:, 0]) ** 2)
+
+	def test_submission_pins_metrics_calibration_set(self, mock_client, crystal_3q_dqa):
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=2, shots=4, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=4)
+		program, _ = dev.preprocess()
+		(preprocessed_tape,), _ = program(tape)
+		physical_qubits = list(preprocessed_tape.measurements[0].wires)
+		mock_client.submit_circuits.return_value = make_completed_job(n_shots=4, qubits=physical_qubits)
+
+		dev.execute((preprocessed_tape,))
+
+		_, kwargs = mock_client.submit_circuits.call_args
+		assert kwargs["calibration_set_id"] == crystal_3q_dqa.calibration_set_id
+		assert kwargs["qubit_mapping"] is None
+
+	@pytest.mark.parametrize("unsupported_capability", ["move", "computational_resonators"])
+	def test_quality_aware_layout_rejects_star_capabilities(self, star_dqa, unsupported_capability):
+		if unsupported_capability == "move":
+			dqa = star_dqa.model_copy(update={"computational_resonators": []})
+		else:
+			gates = {name: gate for name, gate in star_dqa.gates.items() if name != "move"}
+			dqa = star_dqa.model_copy(update={"gates": gates})
+		mock_client = MagicMock()
+		mock_client.get_dynamic_quantum_architecture.return_value = dqa
+		mock_client.get_calibration_quality_metrics.return_value = make_quality_metrics()
+		dev = make_device(wires=2, shots=None, use_connectivity=True, use_metrics=True)
+		dev._client = mock_client
+		tape = QuantumScript([qml.CNOT(wires=[0, 1])], [qml.sample(wires=[0, 1])], shots=100)
+
+		with pytest.raises(NotImplementedError, match="does not support MOVE gates or computational resonators"):
+			dev.to_iqm_circuits(tape)
 
 
 class TestToIQMCircuits:
@@ -474,7 +813,7 @@ class TestExecute:
 		mock_client.get_dynamic_quantum_architecture.return_value = star_dqa
 		mock_client.submit_circuits.return_value = make_completed_job(n_shots=4, qubits=["QB1"])
 
-		dev = make_device(wires=3, shots=4, use_connectivity=True)
+		dev = make_device(wires=3, shots=4, use_connectivity=True, optimize_layout=False)
 		dev._client = mock_client
 
 		tape = QuantumScript([qml.PauliX(wires=0)], [qml.sample(wires=[0])], shots=4)
