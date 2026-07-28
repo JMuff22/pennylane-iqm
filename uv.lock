@@ -1625,6 +1625,7 @@ dependencies = [
     { name = "iqm-client" },
     { name = "numpy" },
     { name = "pennylane" },
+    { name = "rustworkx" },
 ]
 
 [package.optional-dependencies]
@@ -1652,6 +1653,7 @@ requires-dist = [
     { name = "iqm-pulla", extras = ["notebook"], marker = "extra == 'pulla'", specifier = "==13.0.3" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "pennylane", specifier = ">=0.40" },
+    { name = "rustworkx", specifier = "==0.17.1" },
 ]
 provides-extras = ["pulla"]
 
