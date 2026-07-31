@@ -229,6 +229,39 @@ class TestExecutionConfig:
 		assert make_device().supports_derivatives() is False
 
 
+class TestTorchQNode:
+	def test_torch_parameter_with_gradient_translates_and_differentiates(self):
+		torch = pytest.importorskip("torch")
+		mock_client = MagicMock()
+
+		def submit_circuits(circuits, *, shots, **_kwargs):
+			job = make_mock_job([JobStatus.COMPLETED])
+			job.result.return_value = [{"meas_QB1": [[int(index % 2)] for index in range(shots)]} for _ in circuits]
+			return job
+
+		mock_client.submit_circuits.side_effect = submit_circuits
+		dev = make_device(wires=1, shots=10, use_connectivity=False)
+		dev._client = mock_client
+
+		@qml.qnode(dev, interface="torch")
+		def circuit(angle):
+			qml.RX(angle, wires=0)
+			return qml.expval(qml.PauliZ(0))
+
+		angle = torch.tensor(0.2, requires_grad=True)
+		iqm_circuits = dev.to_iqm_circuits(circuit.construct((angle,), {}))
+		result = circuit(angle)
+		result.backward()
+
+		assert angle.grad is not None
+		assert isinstance(iqm_circuits[0].instructions[0].args["angle"], float)
+		assert mock_client.submit_circuits.call_count == 2
+		for call in mock_client.submit_circuits.call_args_list:
+			for instruction in call.args[0][0].instructions:
+				if instruction.name == "prx":
+					assert isinstance(instruction.args["angle"], float)
+
+
 class TestPreprocessTransforms:
 	def test_pipeline_without_connectivity(self):
 		# Without a coupling map, _transpile is not added to the pipeline.
