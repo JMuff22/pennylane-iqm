@@ -1,3 +1,7 @@
+## [0.5.1] - 31.07.2026
+
+- Fix translation of gradient-tracked Torch parameters when converting PennyLane tapes to IQM circuits. Add tests for running a QNode with torch interface.
+
 ## [0.5.0] - 28.07.2026
 
 - Add `optimize_layout` in `IQMDevice` which selects a pennylane-circuit aware initial layout based on the DQA, prioritising reducing the number of SWAPs and then number of CZ gates. Defaults to True.
