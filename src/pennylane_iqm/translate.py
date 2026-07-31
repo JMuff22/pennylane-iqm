@@ -130,10 +130,11 @@ def op_to_iqm(op: qml.operation.Operator, wire_map: WireMap) -> list[CircuitOper
 		ValueError: If the operator's name is not in SUPPORTED_OPS.
 	"""
 	name = op.name
-	# PennyLane parameters are TensorLike (numpy scalar / array / interface tensor).
-	# np.asarray normalises them to ndarray, then .item() extracts a Python scalar
-	# that float() accepts without static-type ambiguity.
-	params = [float(np.asarray(p).item()) for p in op.parameters]
+	# IQM circuits have concrete numeric gate parameters. PennyLane's interface-
+	# aware unwrap detaches Torch tensors before conversion, while preserving the
+	# scalar value used by the hardware. ``np.asarray`` is not safe here because
+	# PyTorch rejects implicit NumPy conversion while tracking gradients.
+	params = [float(qml.math.unwrap(p)) for p in op.parameters]
 	wires = [wire_map[w] for w in op.wires]
 
 	match name:
