@@ -209,11 +209,13 @@ def _two_qubit_noise(coherence: dict[str, tuple[float, float]], duration: float,
 	return apply
 
 
-def _readout_noise(qubit: str, error_0_to_1: float, error_1_to_0: float) -> Callable:
-	kraus = _readout_kraus(error_0_to_1, error_1_to_0)
+def _readout_noise(readout_errors: dict[str, tuple[float, float]]) -> Callable:
+	kraus = {qubit: _readout_kraus(*errors) for qubit, errors in readout_errors.items()}
 
-	def apply(op: qml.measurements.MeasurementProcess, **kwargs) -> None:
-		qml.QubitChannel(kraus, wires=qubit)
+	def apply(mp: qml.measurements.MeasurementProcess, **kwargs) -> None:
+		for wire in mp.wires:
+			if wire in kraus:
+				qml.QubitChannel(kraus[wire], wires=wire)
 
 	return apply
 
@@ -250,25 +252,27 @@ def iqm_noise_model(calibration: IQMCalibration) -> qml.NoiseModel:
 		model_map[qml.noise.op_eq(qml.CZ) & qml.noise.wires_eq([control, target])] = noise
 		model_map[qml.noise.op_eq(qml.CZ) & qml.noise.wires_eq([target, control])] = noise
 
-	meas_map = {
-		qml.noise.wires_in([qubit]): _readout_noise(qubit, error_0_to_1, error_1_to_0)
-		for qubit, (error_0_to_1, error_1_to_0) in calibration.readout_errors.items()
-	}
+	# One entry covering every measured qubit at once: a per-qubit condition would
+	# only fire on single-wire measurements, silently skipping `probs(wires=[a, b])`.
+	measures_calibrated_qubit = qml.BooleanFn(
+		lambda mp: bool(set(mp.wires) & calibration.readout_errors.keys()), "MeasuresCalibratedQubit"
+	)
+	meas_map = {measures_calibrated_qubit: _readout_noise(calibration.readout_errors)}
 
 	return qml.NoiseModel(model_map, meas_map=meas_map)
 
 
-def mock_device(calibration: IQMCalibration, wires: Sequence[str], shots: int | None = None) -> Device:
+def mock_device(calibration: IQMCalibration, wires: Sequence[str]) -> Device:
 	"""Create a local noisy simulator standing in for an IQM QPU.
 
 	The returned device is ``default.mixed`` with the calibration-derived noise
 	model applied, so its memory cost grows as ``4 ** len(wires)``. Use the
-	handful of physical qubits the circuit actually runs on.
+	handful of physical qubits the circuit actually runs on. Shots are set
+	per-QNode, as with :class:`~pennylane_iqm.IQMDevice`.
 
 	Args:
 		calibration: Calibration data of the QPU being modelled.
 		wires: Physical IQM qubit names to simulate, e.g. ``["QB1", "QB2"]``.
-		shots: Shots per execution. Defaults to None (analytic).
 
 	Returns:
 		A PennyLane device that samples from the noisy QPU model.
@@ -280,7 +284,7 @@ def mock_device(calibration: IQMCalibration, wires: Sequence[str], shots: int | 
 	if unknown:
 		raise ValueError(f"No calibration data for qubits {sorted(unknown)}.")
 
-	device = qml.device("default.mixed", wires=list(wires), shots=shots)
+	device = qml.device("default.mixed", wires=list(wires))
 	# qml.add_noise is an untyped dispatching transform; applied to a Device it
 	# returns a Device subclass, which its signature does not express.
 	return cast(Device, qml.add_noise(device, iqm_noise_model(calibration)))
