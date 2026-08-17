@@ -1,3 +1,7 @@
+## [0.6.0] - 17.08.2026
+
+- Add mock device using new class `IQMCalibration` which allows using pennylane `device.mixed` to simulate using both dynamic calibration data from IQM device DQA or uniform noise data.
+
 ## [0.5.1] - 31.07.2026
 
 - Fix translation of gradient-tracked Torch parameters when converting PennyLane tapes to IQM circuits. Add tests for running a QNode with torch interface.

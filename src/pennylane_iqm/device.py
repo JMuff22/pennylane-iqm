@@ -27,6 +27,7 @@ from pennylane.typing import Result
 
 from .gates import stopping_condition
 from .layout import _DEFAULT_MAX_CANDIDATES, _map_tape, _select_initial_layout, _transpile
+from .noise import IQMCalibration
 from .result import iqm_result_to_samples
 from .translate import WireMap, build_wire_map, tape_to_iqm_circuit
 
@@ -193,6 +194,24 @@ class IQMDevice(Device):
 			return None
 		_, metrics = self._layout_context()
 		return metrics
+
+	def calibration(self) -> IQMCalibration:
+		"""Read the calibration data of the connected QPU.
+
+		Returns:
+			Coherence times, gate errors and durations, and readout errors of the
+			server's current calibration set, suitable for local noisy simulation
+			via :func:`~pennylane_iqm.mock_device`.
+
+		Raises:
+			RuntimeError: If no dynamic quantum architecture is available.
+		"""
+		dqa = self.architecture
+		if dqa is None:
+			raise RuntimeError("Cannot read calibration data without a dynamic quantum architecture.")
+		if self._metrics is None:
+			self._metrics = self.client.get_calibration_quality_metrics(dqa.calibration_set_id)
+		return IQMCalibration.from_metrics(dqa, self._metrics)
 
 	def _layout_context(self) -> tuple[DynamicQuantumArchitecture, ObservationFinder | None]:
 		"""Return the DQA and optional metrics required by layout optimization."""
