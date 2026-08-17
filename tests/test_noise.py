@@ -84,6 +84,18 @@ def test_readout_error_reaches_measured_probabilities(calibration, qubit):
 	assert idle() == pytest.approx([1.0 - error_0_to_1, error_0_to_1])
 
 
+def test_readout_error_reaches_multi_wire_measurements(calibration):
+	"""A per-qubit measurement condition would only fire on single-wire measurements."""
+	dev = mock_device(calibration, wires=["QB1", "QB2"])
+
+	@qml.qnode(dev)
+	def idle():
+		return qml.probs(wires=["QB1", "QB2"])
+
+	no_flip = (1.0 - READOUT["QB1"][0]) * (1.0 - READOUT["QB2"][0])
+	assert idle()[0] == pytest.approx(no_flip)
+
+
 def test_cz_noise_is_applied_in_either_wire_order(calibration):
 	dev = mock_device(calibration, wires=["QB1", "QB2"])
 
@@ -101,7 +113,7 @@ def test_cz_noise_is_applied_in_either_wire_order(calibration):
 	forward = bell("QB1", "QB2")
 	assert forward == pytest.approx(bell("QB2", "QB1"))
 	# A Bell state read out through a noisy channel keeps most weight on |00> and |11>.
-	assert forward[0] + forward[3] == pytest.approx(0.97157, abs=1e-5)
+	assert forward[0] + forward[3] == pytest.approx(0.90776, abs=1e-5)
 
 
 def test_mock_device_rejects_uncalibrated_wires(calibration):
