@@ -1,11 +1,24 @@
 [build-system]
-requires = ["setuptools>=68.0.0", "setuptools_scm[toml]>=7"]
+requires = ["setuptools>=77.0.0", "setuptools_scm[toml]>=7"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pennylane-iqm"
 description = "PennyLane device adapter for IQM quantum computers via iqm-client"
+readme = "README.md"
 authors = [{ name = "Jake Muff", email = "jake.muff@vtt.fi" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["pennylane", "iqm", "quantum computing", "quantum", "qubit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Typing :: Typed",
+]
 requires-python = ">=3.11, <3.13"
 dynamic = ["version"]
 dependencies = [
@@ -19,6 +32,12 @@ dependencies = [
 pulla = [
     "iqm-pulla[notebook]==13.0.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/JMuff22/pennylane-iqm"
+Repository = "https://github.com/JMuff22/pennylane-iqm"
+Issues = "https://github.com/JMuff22/pennylane-iqm/issues"
+Changelog = "https://github.com/JMuff22/pennylane-iqm/blob/main/CHANGELOG.md"
 
 [tool.setuptools_scm]
 # See configuration details in https://github.com/pypa/setuptools_scm
