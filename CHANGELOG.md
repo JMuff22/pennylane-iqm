@@ -1,3 +1,10 @@
+## [0.7.0] - 23.09.2026
+
+- Fix mock device applying CZ noise twice (`wires_eq` matched both wire orders).
+- Fix mock device applying too many noisy single qubit gates.
+- Speed up `mock_device` roughly 10x for batched training: noise is inserted in a single pass over the circuit instead of `qml.NoiseModel` conditions, and multi-qubit measurements no longer re-simulate the circuit once per measured qubit.
+- **Breaking:** remove `iqm_noise_model` from the public API; use `mock_device`.
+
 ## [0.6.0] - 17.08.2026
 
 - Add mock device using new class `IQMCalibration` which allows using pennylane `device.mixed` to simulate using both dynamic calibration data from IQM device DQA or uniform noise data.

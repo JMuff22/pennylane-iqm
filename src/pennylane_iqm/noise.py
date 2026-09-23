@@ -9,6 +9,9 @@ Physical assumptions:
 * Gate infidelity is modelled as depolarizing noise with probability
   ``1 - fidelity``, spread uniformly over the non-identity Paulis, composed
   with thermal relaxation over the gate duration.
+* One-qubit gates are charged as the hardware compiles them: each run of
+  one-qubit gates between two-qubit gates is one PRX, and Z rotations are
+  virtual and noiseless. Idle qubits do not decohere.
 * Readout error is a classical confusion map applied immediately before
   measurement.
 """
@@ -16,7 +19,7 @@ Physical assumptions:
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from typing import cast
 
 import numpy as np
@@ -24,8 +27,8 @@ import pennylane as qml
 from iqm.station_control.client.qon import ObservationFinder
 from iqm.station_control.interface.models import DynamicQuantumArchitecture
 from pennylane.devices import Device
+from pennylane.tape import QuantumScript
 
-from .gates import SUPPORTED_SINGLE_QUBIT_OPS
 
 _PAULIS: tuple[np.ndarray, ...] = (
 	np.eye(2),
@@ -55,7 +58,7 @@ class IQMCalibration:
 	"""Calibration data of an IQM QPU, keyed by physical qubit name.
 
 	Times are in seconds. Loci absent from the calibration set are simply absent
-	from these mappings, and receive no noise in the generated noise model.
+	from these mappings, and receive no noise in :func:`mock_device`.
 
 	Attributes:
 		t1: Energy relaxation time per qubit (s).
@@ -189,77 +192,72 @@ class IQMCalibration:
 		)
 
 
-def _single_qubit_noise(t1: float, t2: float, duration: float, error: float) -> Callable:
-	def apply(op: qml.operation.Operator, **kwargs) -> None:
-		qml.ThermalRelaxationError(0.0, t1, t2, duration, wires=op.wires)
-		qml.DepolarizingChannel(error, wires=op.wires)
-
-	return apply
+# Z rotations are virtual on IQM hardware: frame updates with no pulse, error or duration.
+_VIRTUAL_Z_OPS = frozenset({"RZ", "PhaseShift", "PauliZ", "S", "T"})
 
 
-def _two_qubit_noise(coherence: dict[str, tuple[float, float]], duration: float, error: float) -> Callable:
-	kraus = _two_qubit_depolarizing_kraus(error)
+@qml.transform
+def _add_iqm_noise(tape: QuantumScript, calibration: IQMCalibration) -> tuple:
+	"""Insert calibration-derived noise the way the circuit would run on hardware.
 
-	def apply(op: qml.operation.Operator, **kwargs) -> None:
-		qml.QubitChannel(kraus, wires=op.wires)
-		for wire in op.wires:
-			t1, t2 = coherence[wire]
-			qml.ThermalRelaxationError(0.0, t1, t2, duration, wires=wire)
-
-	return apply
-
-
-def _readout_noise(readout_errors: dict[str, tuple[float, float]]) -> Callable:
-	kraus = {qubit: _readout_kraus(*errors) for qubit, errors in readout_errors.items()}
-
-	def apply(mp: qml.measurements.MeasurementProcess, **kwargs) -> None:
-		for wire in mp.wires:
-			if wire in kraus:
-				qml.QubitChannel(kraus[wire], wires=wire)
-
-	return apply
-
-
-def iqm_noise_model(calibration: IQMCalibration) -> qml.NoiseModel:
-	"""Build a PennyLane noise model from IQM calibration data.
-
-	Circuit wires must be labelled with physical IQM qubit names, which is how
-	:class:`~pennylane_iqm.IQMDevice` labels them once layout optimization has run.
-
-	Args:
-		calibration: Calibration data of the QPU being modelled.
-
-	Returns:
-		Noise model applying gate and readout noise to the calibrated loci.
+	The IQM translator merges each run of one-qubit gates between two-qubit gates
+	into a single physical PRX (see ``_optimize_single_qubit_gates``), so each run
+	gets PRX noise once, just before the gate that ends it. A run of only virtual
+	Z rotations compiles to no pulse and gets none. A PRX whose merged angle
+	happens to be zero is still charged, as the angle is unknown at trace time.
+	CNOT is compiled as ``H CZ H`` on the target. Other multi-qubit operators
+	receive no gate noise. Readout noise is applied to every calibrated qubit on
+	the tape after the last gate.
 	"""
-	single_qubit_ops = sorted(SUPPORTED_SINGLE_QUBIT_OPS)
-	model_map: dict = {}
+	coherent = calibration.t1.keys() & calibration.t2.keys()
+	operations: list[qml.operation.Operator] = []
+	pending: set[str] = set()
 
-	for qubit, error in calibration.prx_error.items():
-		if qubit not in calibration.t1 or qubit not in calibration.t2:
-			continue
-		condition = qml.noise.op_in(single_qubit_ops) & qml.noise.wires_eq(qubit)
-		model_map[condition] = _single_qubit_noise(
-			calibration.t1[qubit], calibration.t2[qubit], calibration.prx_duration[qubit], error
+	def relax(qubit: str, duration: float) -> None:
+		operations.append(
+			qml.ThermalRelaxationError(0.0, calibration.t1[qubit], calibration.t2[qubit], duration, wires=qubit)
 		)
 
-	for (control, target), error in calibration.cz_error.items():
-		if not {control, target} <= calibration.t1.keys() & calibration.t2.keys():
-			continue
-		coherence = {qubit: (calibration.t1[qubit], calibration.t2[qubit]) for qubit in (control, target)}
-		noise = _two_qubit_noise(coherence, calibration.cz_duration[(control, target)], error)
-		# CZ is symmetric, but PennyLane matches the operator's wire order.
-		model_map[qml.noise.op_eq(qml.CZ) & qml.noise.wires_eq([control, target])] = noise
-		model_map[qml.noise.op_eq(qml.CZ) & qml.noise.wires_eq([target, control])] = noise
+	def flush(wires: Iterable[str]) -> None:
+		for qubit in wires:
+			if qubit in pending:
+				pending.discard(qubit)
+				if qubit in calibration.prx_error and qubit in coherent:
+					relax(qubit, calibration.prx_duration[qubit])
+					operations.append(qml.DepolarizingChannel(calibration.prx_error[qubit], wires=qubit))
 
-	# One entry covering every measured qubit at once: a per-qubit condition would
-	# only fire on single-wire measurements, silently skipping `probs(wires=[a, b])`.
-	measures_calibrated_qubit = qml.BooleanFn(
-		lambda mp: bool(set(mp.wires) & calibration.readout_errors.keys()), "MeasuresCalibratedQubit"
-	)
-	meas_map = {measures_calibrated_qubit: _readout_noise(calibration.readout_errors)}
+	for op in tape.operations:
+		if isinstance(op, qml.operation.Channel):
+			operations.append(op)
+		elif len(op.wires) == 1:
+			if op.name not in _VIRTUAL_Z_OPS:
+				pending.update(op.wires.tolist())
+			operations.append(op)
+		elif op.name in ("CZ", "CNOT"):
+			control, target = op.wires
+			if op.name == "CNOT":
+				pending.add(target)
+			flush(op.wires)
+			operations.append(op)
+			pair = (control, target) if (control, target) in calibration.cz_error else (target, control)
+			if pair in calibration.cz_error and {control, target} <= coherent:
+				operations.append(
+					qml.QubitChannel(_two_qubit_depolarizing_kraus(calibration.cz_error[pair]), wires=op.wires)
+				)
+				for qubit in op.wires:
+					relax(qubit, calibration.cz_duration[pair])
+			if op.name == "CNOT":
+				pending.add(target)
+		else:
+			flush(op.wires)
+			operations.append(op)
 
-	return qml.NoiseModel(model_map, meas_map=meas_map)
+	flush(tape.wires)
+	for qubit in tape.wires:
+		if qubit in calibration.readout_errors:
+			operations.append(qml.QubitChannel(_readout_kraus(*calibration.readout_errors[qubit]), wires=qubit))
+
+	return [tape.copy(operations=operations)], lambda results: results[0]
 
 
 def mock_device(calibration: IQMCalibration, wires: Sequence[str]) -> Device:
@@ -285,6 +283,6 @@ def mock_device(calibration: IQMCalibration, wires: Sequence[str]) -> Device:
 		raise ValueError(f"No calibration data for qubits {sorted(unknown)}.")
 
 	device = qml.device("default.mixed", wires=list(wires))
-	# qml.add_noise is an untyped dispatching transform; applied to a Device it
-	# returns a Device subclass, which its signature does not express.
-	return cast(Device, qml.add_noise(device, iqm_noise_model(calibration)))
+	# Transforms are untyped dispatchers; applied to a Device they return a
+	# Device subclass, which their signature does not express.
+	return cast(Device, _add_iqm_noise(device, calibration=calibration))
