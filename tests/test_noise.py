@@ -112,8 +112,41 @@ def test_cz_noise_is_applied_in_either_wire_order(calibration):
 
 	forward = bell("QB1", "QB2")
 	assert forward == pytest.approx(bell("QB2", "QB1"))
-	# A Bell state read out through a noisy channel keeps most weight on |00> and |11>.
-	assert forward[0] + forward[3] == pytest.approx(0.90776, abs=1e-5)
+	# Matches a hand-built circuit with CZ noise applied exactly once (0.90776 was the
+	# regressed value where both wire-order conditions fired).
+	assert forward[0] + forward[3] == pytest.approx(0.91887, abs=1e-5)
+
+
+def test_per_qubit_measurements_run_as_one_simulation(calibration):
+	"""Distinct readout noise per measurement made add_noise re-simulate once per measured qubit."""
+	dev = mock_device(calibration, wires=["QB1", "QB2", "QB3"])
+
+	@qml.qnode(dev)
+	def circuit():
+		return [qml.expval(qml.PauliZ(qubit)) for qubit in ("QB1", "QB2", "QB3")]
+
+	with qml.Tracker(dev) as tracker:
+		circuit()
+	assert tracker.totals["simulations"] == 1
+
+
+def test_one_qubit_runs_are_charged_as_one_prx(calibration):
+	"""Hardware merges each run between CZs into one PRX; Z rotations are virtual."""
+	dev = mock_device(calibration, wires=["QB1", "QB2"])
+
+	@qml.qnode(dev)
+	def circuit():
+		qml.RX(0.1, "QB1")
+		qml.RZ(0.2, "QB1")
+		qml.RY(0.3, "QB1")
+		qml.RZ(0.4, "QB2")
+		qml.CZ(["QB1", "QB2"])
+		qml.Hadamard("QB2")
+		return qml.probs(wires=["QB1", "QB2"])
+
+	[tape], _ = qml.workflow.construct_batch(circuit, level="device")()
+	prx_noise = [op.wires[0] for op in tape.operations if isinstance(op, qml.DepolarizingChannel)]
+	assert sorted(prx_noise) == ["QB1", "QB2"]
 
 
 def test_mock_device_rejects_uncalibrated_wires(calibration):
