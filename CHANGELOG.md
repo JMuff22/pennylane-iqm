@@ -1,3 +1,11 @@
+## [0.8.0] - 23.11.2026
+
+- Update to `iqm-client==37.0.0` (IQM OS 4.8) and `iqm-pulla==16.0.0`.
+- `IQMDevice.client` is built with `IQMClient.from_url`; the `IQMClient` constructor now takes executor and storage objects.
+- Jobs are tracked with `CircuitJobTracker`; `JobStatus` is imported from `iqm.station_control.interface.models.jobs_new`.
+- Add `IQMDevice(drop_final_rz=...)` to keep terminal RZ frame updates. Defaults to `True` (dropped), unlike iqm-client 36+, because `IQMDevice` diagonalizes measurements before translation, so only Z-basis readout follows.
+- The Pulla playlist notebook uses `IQMClient.get_standard_compiler()`; the standalone `Pulla` client was merged into `IQMClient`.
+
 ## [0.7.0] - 23.09.2026
 
 - Fix mock device applying CZ noise twice (`wires_eq` matched both wire orders).

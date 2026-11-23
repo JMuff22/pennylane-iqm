@@ -30,11 +30,11 @@ def _observations(qubits: list[str], cz_loci: list[tuple[str, str]]) -> list[Obs
 		observations.append(_observation(f"characterization.model.{qubit}.t2_time", T2[qubit], "s"))
 		observations.append(_observation(f"metrics.ssro.measure.constant.{qubit}.error_0_to_1", READOUT[qubit][0]))
 		observations.append(_observation(f"metrics.ssro.measure.constant.{qubit}.error_1_to_0", READOUT[qubit][1]))
-		observations.append(_observation(f"metrics.rb.prx.drag_gaussian.{qubit}.fidelity", PRX_FIDELITY))
+		observations.append(_observation(f"metrics.rb.prx.drag_gaussian.{qubit}.fidelity:par=d2", PRX_FIDELITY))
 		observations.append(_observation(f"gates.prx.drag_gaussian.{qubit}.duration", PRX_DURATION, "s"))
 	for control, target in cz_loci:
 		locus = f"{control}__{target}"
-		observations.append(_observation(f"metrics.irb.cz.tgss.{locus}.fidelity", CZ_FIDELITY))
+		observations.append(_observation(f"metrics.irb.cz.tgss.{locus}.fidelity:par=d2", CZ_FIDELITY))
 		observations.append(_observation(f"gates.cz.tgss.{locus}.duration", CZ_DURATION, "s"))
 	return observations
 

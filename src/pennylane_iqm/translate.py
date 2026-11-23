@@ -208,7 +208,9 @@ def build_wire_map(
 	return dict(zip(ordered, qubits, strict=False))
 
 
-def tape_to_iqm_circuit(tape: QuantumScript, wire_map: WireMap, circuit_name: str = "pennylane_circuit") -> Circuit:
+def tape_to_iqm_circuit(
+	tape: QuantumScript, wire_map: WireMap, circuit_name: str = "pennylane_circuit", drop_final_rz: bool = True
+) -> Circuit:
 	"""Convert a preprocessed QuantumScript into an IQM Circuit.
 
 	Gate operations are translated first; measure instructions are appended
@@ -219,6 +221,8 @@ def tape_to_iqm_circuit(tape: QuantumScript, wire_map: WireMap, circuit_name: st
 			SUPPORTED_OPS by the preprocessing pipeline.
 		wire_map: Mapping from PennyLane wire labels to IQM qubit names.
 		circuit_name: Name to attach to the resulting IQM circuit.
+		drop_final_rz: Whether to drop terminal RZ frame updates. This preserves
+			computational-basis measurement probabilities but not the unitary.
 
 	Returns:
 		An IQM Circuit ready for submission via IQMClient.submit_circuits.
@@ -227,7 +231,7 @@ def tape_to_iqm_circuit(tape: QuantumScript, wire_map: WireMap, circuit_name: st
 
 	for op in tape.operations:
 		instructions.extend(op_to_iqm(op, wire_map))
-	instructions = list(_optimize_single_qubit_gates(instructions))
+	instructions = list(_optimize_single_qubit_gates(instructions, drop_final_rz))
 
 	measured_wires: list[Hashable] = []
 	for mp in tape.measurements:
