@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pennylane as qml
 import pytest
-from iqm.iqm_server_client.models import JobStatus
+from iqm.station_control.interface.models.jobs_new import JobStatus
 from pennylane.devices import ExecutionConfig
 from pennylane.tape import QuantumScript
 
@@ -93,7 +93,7 @@ class TestIQMDeviceInit:
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
 			mock_client = MagicMock()
 			mock_client.get_dynamic_quantum_architecture.return_value = crystal_3q_dqa
-			MockClient.return_value = mock_client
+			MockClient.from_url.return_value = mock_client
 			dev = IQMDevice("https://x", wires=None, use_connectivity=True)
 		assert len(dev.wires) == 3
 		assert dev._dqa is crystal_3q_dqa
@@ -102,7 +102,7 @@ class TestIQMDeviceInit:
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
 			mock_client = MagicMock()
 			mock_client.get_dynamic_quantum_architecture.side_effect = RuntimeError("unreachable")
-			MockClient.return_value = mock_client
+			MockClient.from_url.return_value = mock_client
 			with pytest.raises(RuntimeError, match="Could not auto-detect"):
 				IQMDevice("https://x", wires=None, use_connectivity=True)
 
@@ -122,16 +122,16 @@ class TestIQMDeviceClient:
 	def test_client_created_without_token_kwarg(self):
 		dev = make_device(token=None)
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
-			MockClient.return_value = MagicMock()
+			MockClient.from_url.return_value = MagicMock()
 			_ = dev.client
-			MockClient.assert_called_once_with("https://test.iqm.fi")
+			MockClient.from_url.assert_called_once_with("https://test.iqm.fi")
 
 	def test_client_passes_explicit_token(self):
 		dev = make_device(token="tok123")
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
-			MockClient.return_value = MagicMock()
+			MockClient.from_url.return_value = MagicMock()
 			_ = dev.client
-			MockClient.assert_called_once_with("https://test.iqm.fi", token="tok123")
+			MockClient.from_url.assert_called_once_with("https://test.iqm.fi", token="tok123")
 
 	def test_client_does_not_pass_env_token(self, monkeypatch):
 		# Critical: IQMClient raises ClientConfigurationError if token is passed
@@ -139,9 +139,9 @@ class TestIQMDeviceClient:
 		monkeypatch.setenv("IQM_TOKEN", "env-token")
 		dev = make_device(token=None)
 		with patch("pennylane_iqm.device.IQMClient") as MockClient:
-			MockClient.return_value = MagicMock()
+			MockClient.from_url.return_value = MagicMock()
 			_ = dev.client
-			MockClient.assert_called_once_with("https://test.iqm.fi")
+			MockClient.from_url.assert_called_once_with("https://test.iqm.fi")
 
 
 class TestArchitecture:
@@ -623,6 +623,16 @@ class TestToIQMCircuits:
 		assert {instruction.name for instruction in circuit.instructions} <= {"prx", "cz", "measure"}
 		assert [instruction.name for instruction in circuit.instructions[-2:]] == ["measure", "measure"]
 
+	@pytest.mark.parametrize("drop_final_rz, expected_prx", [(True, 1), (False, 3)])
+	def test_drop_final_rz_controls_terminal_frame_update(self, drop_final_rz, expected_prx):
+		# RX(0.3) then RZ(0.5) leaves a nonzero terminal frame, kept as two PRX(pi) gates.
+		dev = make_device(wires=1, drop_final_rz=drop_final_rz)
+		tape = QuantumScript([qml.RX(0.3, wires=0), qml.RZ(0.5, wires=0)], [qml.sample(wires=[0])], shots=100)
+
+		(circuit,) = dev.to_iqm_circuits(tape)
+
+		assert [instruction.name for instruction in circuit.instructions].count("prx") == expected_prx
+
 	def test_names_circuits_created_by_broadcast_expansion(self):
 		dev = make_device(wires=1)
 		tape = QuantumScript([qml.RX(np.array([0.1, 0.2]), wires=0)], [qml.sample(wires=[0])], shots=100)
@@ -689,7 +699,7 @@ class TestCollectMeasuredWires:
 
 class TestWaitForJob:
 	def test_completes_immediately(self):
-		from iqm.iqm_server_client.models import JobStatus
+		from iqm.station_control.interface.models.jobs_new import JobStatus
 
 		dev = make_device(poll_interval=0)
 		measurements = {"meas_QB1": [[0]]}
@@ -697,7 +707,7 @@ class TestWaitForJob:
 		assert dev._wait_for_job(job) == [measurements]
 
 	def test_waits_for_processing_then_completes(self):
-		from iqm.iqm_server_client.models import JobStatus
+		from iqm.station_control.interface.models.jobs_new import JobStatus
 
 		dev = make_device(poll_interval=0)
 		measurements = {"meas_QB1": [[0]]}
@@ -707,17 +717,17 @@ class TestWaitForJob:
 
 	@pytest.mark.parametrize("terminal", ["FAILED", "CANCELLED"])
 	def test_terminal_failure_raises_runtime_error(self, terminal):
-		from iqm.iqm_server_client.models import JobStatus
+		from iqm.station_control.interface.models.jobs_new import JobStatus
 
 		dev = make_device(poll_interval=0)
 		job = make_mock_job([JobStatus[terminal]])
-		job.data = MagicMock()
-		job.data.errors = []
+		job.job_data = MagicMock()
+		job.job_data.errors = []
 		with pytest.raises(RuntimeError, match=terminal.lower()):
 			dev._wait_for_job(job)
 
 	def test_timeout_raises_timeout_error(self):
-		from iqm.iqm_server_client.models import JobStatus
+		from iqm.station_control.interface.models.jobs_new import JobStatus
 
 		dev = make_device(poll_interval=0, timeout=0.0)
 		job = make_mock_job([JobStatus.PROCESSING])

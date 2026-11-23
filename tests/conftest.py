@@ -127,7 +127,7 @@ def make_mock_job(status_sequence, measurements: dict | None = None):
 
 def make_completed_job(n_shots: int = 4, qubits: list[str] | None = None):
 	"""Return a mock job that immediately returns COMPLETED with binary measurements."""
-	from iqm.iqm_server_client.models import JobStatus
+	from iqm.station_control.interface.models.jobs_new import JobStatus
 
 	if qubits is None:
 		qubits = ["QB1", "QB2"]

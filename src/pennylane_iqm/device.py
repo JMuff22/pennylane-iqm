@@ -11,11 +11,11 @@ from typing import cast, overload
 import numpy as np
 import pennylane as qml
 from iqm.iqm_client import IQMClient
-from iqm.iqm_client.iqm_client import CircuitJob
+from iqm.station_control.client.job_trackers import CircuitJobTracker
 from iqm.iqm_client.models import CircuitCompilationOptions
 from iqm.iqm_client.transpile import transpile_insert_moves
 from iqm.pulse.circuit_operations import Circuit
-from iqm.iqm_server_client.models import JobStatus
+from iqm.station_control.interface.models.jobs_new import JobStatus
 from iqm.station_control.client.qon import ObservationFinder
 from iqm.station_control.interface.models import CircuitMeasurementResultsBatch, DynamicQuantumArchitecture
 from pennylane.devices import Device, ExecutionConfig
@@ -84,6 +84,10 @@ class IQMDevice(Device):
 		    quality metrics. Implies optimize_layout=True.
 	    max_candidates: Maximum complete layouts scored in each optimized
 		    search phase. Defaults to 10000.
+	    drop_final_rz: Drop terminal RZ frame updates during translation. This
+		    preserves Z-basis measurement outcomes but not the circuit unitary.
+		    Keeping them costs two physical PRX gates per affected qubit.
+		    Defaults to True.
 	"""
 
 	name = "iqm.direct"
@@ -102,6 +106,7 @@ class IQMDevice(Device):
 		use_metrics: bool = False,
 		max_candidates: int = _DEFAULT_MAX_CANDIDATES,
 		optimize_layout: bool = True,
+		drop_final_rz: bool = True,
 	):
 		if shots is not None and shots < 1:
 			raise ValueError("IQMDevice requires shots >= 1 (hardware execution).")
@@ -126,6 +131,7 @@ class IQMDevice(Device):
 		self._optimize_layout = optimize_layout or use_metrics
 		self._use_metrics = use_metrics
 		self._max_candidates = max_candidates
+		self._drop_final_rz = drop_final_rz
 
 		self._client: IQMClient | None = None
 		self._dqa: DynamicQuantumArchitecture | None = None
@@ -152,7 +158,7 @@ class IQMDevice(Device):
 			kwargs: dict[str, str] = {}
 			if self._token is not None:
 				kwargs["token"] = self._token
-			self._client = IQMClient(self._server_url, **kwargs)
+			self._client = IQMClient.from_url(self._server_url, **kwargs)
 		return self._client
 
 	@property
@@ -310,6 +316,10 @@ class IQMDevice(Device):
 		and routes the tape exactly as it does before hardware execution. A single
 		PennyLane tape can therefore produce more than one IQM circuit.
 
+		Unless the device was created with ``drop_final_rz=False``, terminal RZ
+		frame updates are dropped. Z-basis measurement outcomes are preserved, but
+		the circuit unitary differs from the tape by a final Z rotation per qubit.
+
 		Args:
 			tape: PennyLane tape to preprocess and translate.
 			circuit_name: Base name for the IQM circuits. When preprocessing
@@ -440,7 +450,7 @@ class IQMDevice(Device):
 		wire_map = self._wire_map(tape)
 		measured_wires = self._collect_measured_wires(tape)
 
-		circuit = tape_to_iqm_circuit(tape, wire_map, circuit_name)
+		circuit = tape_to_iqm_circuit(tape, wire_map, circuit_name, self._drop_final_rz)
 
 		dqa = self.architecture
 		if dqa is not None and dqa.computational_resonators:
@@ -458,7 +468,7 @@ class IQMDevice(Device):
 					measured.append(w)
 		return measured
 
-	def _wait_for_job(self, job: CircuitJob) -> CircuitMeasurementResultsBatch:
+	def _wait_for_job(self, job: CircuitJobTracker) -> CircuitMeasurementResultsBatch:
 		"""Block-poll until the job reaches a terminal state; return result."""
 		deadline = time.time() + self._timeout
 		while time.time() < deadline:
@@ -470,7 +480,7 @@ class IQMDevice(Device):
 				return result
 			if status in (JobStatus.FAILED, JobStatus.CANCELLED):
 				raise RuntimeError(
-					f"IQM job {job.job_id} ended with status '{status}'. Server errors: {job.data.errors}"
+					f"IQM job {job.job_id} ended with status '{status}'. Server errors: {job.job_data.errors}"
 				)
 			time.sleep(self._poll_interval)
 
