@@ -24,13 +24,13 @@ dynamic = ["version"]
 dependencies = [
     "pennylane>=0.40",
     "numpy>=2.0",
-    "iqm-client==34.0.3",
+    "iqm-client==37.0.0",
     "rustworkx==0.17.1",
 ]
 
 [project.optional-dependencies]
 pulla = [
-    "iqm-pulla[notebook]==13.0.3",
+    "iqm-pulla[notebook]==16.0.0",
 ]
 
 [project.urls]
