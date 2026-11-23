@@ -1,4 +1,4 @@
-## [0.7.0] - 23.11.2026
+## [0.8.0] - 23.11.2026
 
 - Update to `iqm-client==37.0.0` (IQM OS 4.8) and `iqm-pulla==16.0.0`.
 - `IQMDevice.client` is built with `IQMClient.from_url`; the `IQMClient` constructor now takes executor and storage objects.
